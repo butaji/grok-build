@@ -76,6 +76,7 @@ pub struct WriterSync {
     queued: Arc<AtomicU64>,
     written: Arc<AtomicU64>,
     failed: Arc<AtomicBool>,
+    wedged: Arc<AtomicBool>,
     writer_active: Arc<AtomicBool>,
     event_tx: Option<tokio::sync::mpsc::UnboundedSender<WriterEvent>>,
 }
@@ -90,6 +91,7 @@ impl WriterSync {
             queued: Arc::new(AtomicU64::new(0)),
             written: Arc::new(AtomicU64::new(0)),
             failed: Arc::new(AtomicBool::new(false)),
+            wedged: Arc::new(AtomicBool::new(false)),
             writer_active: Arc::new(AtomicBool::new(false)),
             event_tx: None,
         }
@@ -99,6 +101,7 @@ impl WriterSync {
             queued: Arc::new(AtomicU64::new(0)),
             written: Arc::new(AtomicU64::new(0)),
             failed: Arc::new(AtomicBool::new(false)),
+            wedged: Arc::new(AtomicBool::new(false)),
             writer_active: Arc::new(AtomicBool::new(false)),
             event_tx: Some(event_tx),
         }
@@ -138,8 +141,26 @@ impl WriterSync {
     pub fn failed(&self) -> bool {
         self.failed.load(Ordering::Acquire)
     }
+    /// Whether the writer thread detected a wedged PTY (EAGAIN after deadline).
+    pub fn wedged(&self) -> bool {
+        self.wedged.load(Ordering::Acquire)
+    }
+    /// Mark the writer as wedged — the PTY buffer is full and won't drain.
+    /// Called by the writer thread when write_payload gives up after the deadline.
+    fn mark_wedged(&self) {
+        if self
+            .wedged
+            .compare_exchange(false, true, Ordering::Release, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        if let Some(event_tx) = &self.event_tx {
+            let _ = event_tx.send(WriterEvent::Failed(std::io::Error::other("terminal wedged")));
+        }
+    }
     fn is_drained(&self) -> bool {
-        !self.failed() && self.written() >= self.queued()
+        !self.failed() && !self.wedged() && self.written() >= self.queued()
     }
     /// Block until the writer flushes every accepted payload, output fails, or
     /// the deadline passes.
@@ -269,22 +290,55 @@ impl Drop for WriterThread {
         }
     }
 }
+/// Deadline for a single frame write. Keeps the writer loop responsive to shutdown
+/// signals even when the PTY is wedged.
+const WRITE_DEADLINE: Duration = Duration::from_millis(250);
+
+/// Maximum retries per frame when write returns WouldBlock/EAGAIN.
+/// Each retry is a zero-duration poll, so this adds negligible latency.
+const WRITE_MAX_RETRIES: usize = 10;
+
+/// Write a payload to the terminal, handling EAGAIN/WouldBlock gracefully.
+///
+/// When the PTY buffer is full (e.g. tmux pane full, user paused with Ctrl-S,
+/// slow terminal emulator), write() returns EAGAIN. We retry a bounded number
+/// of times, then if the deadline expires we give up and mark the writer wedged.
+/// This prevents the writer thread from blocking indefinitely, which was the
+/// root cause of PTY freezes in tmux.
 fn write_payload(
     writer: &mut impl Write,
     payload: &WriterPayload,
     sync: &WriterSync,
 ) -> std::io::Result<()> {
-    match writer
-        .write_all(&payload.data)
-        .and_then(|()| writer.flush())
-    {
-        Ok(()) => {
-            sync.mark_written(payload.sequence);
-            Ok(())
-        }
-        Err(error) => {
-            sync.mark_failed(std::io::Error::new(error.kind(), error.to_string()));
-            Err(error)
+    let deadline = Instant::now() + WRITE_DEADLINE;
+    let mut retries = 0;
+
+    loop {
+        match writer.write_all(&payload.data).and_then(|()| writer.flush()) {
+            Ok(()) => {
+                sync.mark_written(payload.sequence);
+                return Ok(());
+            }
+            Err(error) => {
+                // EAGAIN / WouldBlock means the PTY buffer is full.
+                // Retry a bounded number of times before giving up.
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.raw_os_error() == Some(libc::EAGAIN)
+                {
+                    if retries < WRITE_MAX_RETRIES && Instant::now() < deadline {
+                        retries += 1;
+                        // Yield to the OS so the PTY buffer can drain.
+                        std::hint::spin_loop();
+                        continue;
+                    }
+                    // Wedged — mark failed and stop the writer thread.
+                    sync.mark_wedged();
+                    return Err(error);
+                }
+                // Other error — mark failed and stop.
+                sync.mark_failed(std::io::Error::new(error.kind(), error.to_string()));
+                return Err(error);
+            }
         }
     }
 }
@@ -312,12 +366,23 @@ pub fn spawn_writer_thread() -> (
         .spawn(move || -> std::io::Result<()> {
             #[cfg(not(windows))]
             let mut writer: Box<dyn std::io::Write> = {
+                use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
                 let tui_out = xai_tty_utils::dup_tui_stderr().unwrap_or_else(|_| {
-                    use std::os::unix::io::{AsRawFd, FromRawFd};
                     let fd = unsafe { libc::dup(std::io::stderr().as_raw_fd()) };
                     unsafe { std::fs::File::from_raw_fd(fd) }
                 });
-                Box::new(std::io::BufWriter::with_capacity(64 * 1024, tui_out))
+                // Set O_NONBLOCK so write() returns EAGAIN instead of blocking when
+                // the PTY buffer is full. Combined with bounded retries in write_payload(),
+                // this prevents the writer thread from freezing indefinitely in tmux.
+                let raw_fd = tui_out.as_raw_fd();
+                let flags = unsafe { libc::fcntl(raw_fd, libc::F_GETFL) };
+                if flags >= 0 {
+                    unsafe { libc::fcntl(raw_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+                }
+                // SAFETY: we still own the fd after fcntl; IntoRawFd consumes it.
+                let fd = tui_out.into_raw_fd();
+                let file = unsafe { std::fs::File::from_raw_fd(fd) };
+                Box::new(std::io::BufWriter::with_capacity(64 * 1024, file))
             };
             #[cfg(windows)]
             let mut writer: Box<dyn std::io::Write> = Box::new(std::io::BufWriter::with_capacity(

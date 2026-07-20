@@ -120,17 +120,44 @@ pub(crate) fn run_wrapped_command(program: &str, args: &[String]) -> Result<i32>
 
     let (write_tx, write_rx) = std::sync::mpsc::channel::<Vec<u8>>();
     {
+        // Set O_NONBLOCK on the PTY master fd before taking the writer.
+        // When the inner PTY buffer fills, write() returns EAGAIN instead of
+        // blocking indefinitely. Combined with bounded retries below, this
+        // prevents the writer thread from freezing the whole wrap process.
+        #[cfg(unix)]
+        {
+            if let Some(raw_fd) = pair.master.as_raw_fd() {
+                let flags = unsafe { libc::fcntl(raw_fd, libc::F_GETFL) };
+                if flags >= 0 {
+                    unsafe { libc::fcntl(raw_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+                }
+            }
+        }
         let mut writer = pair.master.take_writer()?;
         std::thread::spawn(move || {
             while let Ok(bytes) = write_rx.recv() {
-                // Single-thread write_all: no libc chunking. EIO here almost
-                // always means the slave has closed (child exited); stop.
-                if writer
-                    .write_all(&bytes)
-                    .and_then(|_| writer.flush())
-                    .is_err()
-                {
-                    break;
+                // EAGAIN / WouldBlock means the inner PTY buffer is full.
+                // Retry up to 10 times with spin-loop yielding, then drop the frame.
+                // This prevents indefinite blocking if the inner process isn't reading.
+                let mut retries = 0;
+                loop {
+                    match writer.write_all(&bytes).and_then(|_| writer.flush()) {
+                        Ok(()) => break,
+                        Err(e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                || e.raw_os_error() == Some(libc::EAGAIN) =>
+                        {
+                            if retries < 10 {
+                                retries += 1;
+                                std::hint::spin_loop();
+                            } else {
+                                // PTY wedged — skip this frame and move on.
+                                break;
+                            }
+                        }
+                        // EIO almost always means the slave closed; stop.
+                        Err(_) => break,
+                    }
                 }
             }
         });
@@ -174,6 +201,19 @@ pub(crate) fn run_wrapped_command(program: &str, args: &[String]) -> Result<i32>
     // writer thread (+ NL so ICANON slaves deliver without another key). Paste
     // mashing can spawn multiple workers; fine for a short-lived wrap process.
     {
+        // Set O_NONBLOCK on stdout's fd before locking it. When the outer
+        // terminal's PTY buffer fills (tmux pane full, slow emulator), write()
+        // returns EAGAIN instead of blocking indefinitely — the root cause of
+        // the PTY freeze / deadlock in grok wrap.
+        #[cfg(unix)]
+        {
+            // Use libc::STDOUT_FILENO directly — Stdout doesn't implement AsRawFd.
+            let stdout_fd = libc::STDOUT_FILENO;
+            let flags = unsafe { libc::fcntl(stdout_fd, libc::F_GETFL) };
+            if flags >= 0 {
+                unsafe { libc::fcntl(stdout_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+            }
+        }
         let mut stdout = std::io::stdout().lock();
         let mut filter = Osc52Filter::new()
             .with_wrap_image_handler(move || {
@@ -192,10 +232,30 @@ pub(crate) fn run_wrapped_command(program: &str, args: &[String]) -> Result<i32>
                 Ok(n) => {
                     let filtered = filter.feed(&buf[..n]);
                     if !filtered.is_empty() {
-                        if stdout.write_all(&filtered).is_err() {
-                            break;
+                        // EAGAIN / WouldBlock means the outer PTY buffer is full.
+                        // Retry with bounded spin-loops, then skip the frame.
+                        let mut retries = 0;
+                        loop {
+                            match stdout.write_all(&filtered) {
+                                Ok(()) => {
+                                    let _ = stdout.flush();
+                                    break;
+                                }
+                                Err(e)
+                                    if e.kind() == std::io::ErrorKind::WouldBlock
+                                        || e.raw_os_error() == Some(libc::EAGAIN) =>
+                                {
+                                    if retries < 10 {
+                                        retries += 1;
+                                        std::hint::spin_loop();
+                                    } else {
+                                        // Outer PTY wedged — skip this frame.
+                                        break;
+                                    }
+                                }
+                                Err(_) => break,
+                            }
                         }
-                        let _ = stdout.flush();
                     }
                 }
             }
